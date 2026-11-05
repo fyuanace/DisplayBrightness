@@ -12,12 +12,16 @@ namespace DisplayBrightness;
 public partial class MainWindow : Window
 {
     private const int SchedulesPerPage = 2;
-    private const double MonitorSlotWidth = 392;
+    private const double MonitorSlotWidth = 328;
     private readonly List<MonitorCard> cards = [];
     private int schedulePage;
     private int monitorPage;
     private int monitorsPerPage = 2;
     private readonly DispatcherTimer scheduleTimer = new() { Interval = TimeSpan.FromSeconds(2) };
+    private readonly Dictionary<string, int> pendingCorrections = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, (DdcMonitor Monitor, int Percent)> pendingManualLevels = new(StringComparer.OrdinalIgnoreCase);
+    private int? pendingBasePercent;
+    private int defaultBasePercent = 50;
     private readonly HashSet<DdcMonitor> scheduledMonitors = [];
     private BrightnessSchedule schedule = BrightnessSchedule.Empty;
     private SyncPreferences sync = SyncPreferences.Default;
@@ -36,7 +40,10 @@ public partial class MainWindow : Window
     private string statusMessage = "";
     private string scheduleMessage = "";
 
-    public MainWindow() => InitializeComponent();
+    public MainWindow()
+    {
+        InitializeComponent();
+    }
 
     internal async Task InitializeAsync(bool silent)
     {
@@ -67,7 +74,7 @@ public partial class MainWindow : Window
         }
 
         SyncToggle.IsChecked = sync.Enabled;
-        BaseSlider.Value = sync.BasePercent ?? 50;
+        BaseInput.SetNumber(sync.BasePercent ?? defaultBasePercent);
         retryStartupDiscovery = silent || schedule.Enabled;
         bool startupLoadFailed = false;
         try
@@ -84,7 +91,10 @@ public partial class MainWindow : Window
             return;
 
         if (sync.BasePercent is null && cards.FirstOrDefault(card => card.Reading.HasValue)?.Reading is Brightness first)
-            BaseSlider.Value = first.Percent;
+        {
+            defaultBasePercent = first.Percent;
+            BaseInput.SetNumber(defaultBasePercent);
+        }
         if (syncLoadFailed)
             SetStatus("无法读取已保存的同步设置。重新应用同步亮度即可保存新设置。");
         if (startupLoadFailed)
@@ -116,6 +126,7 @@ public partial class MainWindow : Window
     private async void RefreshClicked(object sender, RoutedEventArgs e)
     {
         await WaitForAutomaticApplyAsync();
+        await ApplyPendingEditsAsync();
         if (!busy && !closed && !editingSchedule)
             await RefreshAsync();
     }
@@ -139,12 +150,14 @@ public partial class MainWindow : Window
             ReleaseCards();
             foreach (var (monitor, reading, message) in readings)
             {
-                var card = new MonitorCard(monitor, sync.CorrectionFor(monitor.Id));
+                int correction = pendingCorrections.GetValueOrDefault(monitor.Id, sync.CorrectionFor(monitor.Id));
+                int manualPercent = pendingManualLevels.TryGetValue(monitor.Id, out var edit)
+                    ? edit.Percent : sync.ManualPercentFor(monitor.Id) ?? reading?.Percent ?? defaultBasePercent;
+                var card = new MonitorCard(monitor, correction, manualPercent);
                 card.SetReading(reading, message);
-                if (reading.HasValue && sync.ManualPercentFor(monitor.Id) is int savedPercent)
-                    card.SetManualTarget(savedPercent);
-                card.ApplyRequested += ManualApplyRequested;
-                card.CorrectionEdited += (_, _) => UpdateSyncControls();
+                card.ManualConfirmed += ManualConfirmed;
+                card.InputEdited += BrightnessInputChanged;
+                card.CorrectionConfirmed += CorrectionConfirmed;
                 cards.Add(card);
             }
 
@@ -231,6 +244,7 @@ public partial class MainWindow : Window
     private async void SyncChanged(object sender, RoutedEventArgs e)
     {
         await WaitForAutomaticApplyAsync();
+        await ApplyPendingEditsAsync();
         if (closed)
             return;
 
@@ -251,8 +265,8 @@ public partial class MainWindow : Window
                 {
                     foreach (var card in cards)
                     {
-                        if (sync.ManualPercentFor(card.Monitor.Id) is int savedPercent)
-                            card.SetManualTarget(savedPercent);
+                        card.SetManualTarget(sync.ManualPercentFor(card.Monitor.Id) ??
+                            card.Reading?.Percent ?? defaultBasePercent);
                     }
                 }
                 scheduledMonitors.Clear();
@@ -262,27 +276,16 @@ public partial class MainWindow : Window
             }
         }
         UpdateSyncControls();
+        await CheckScheduleAsync();
     }
 
-    private void BaseChanged(object sender, RoutedPropertyChangedEventArgs<double> e) => UpdateSyncControls();
+    private void BrightnessInputChanged(object? sender, EventArgs e) => UpdateStatusLine();
 
     private void UpdateSyncControls()
     {
-        if (BaseSlider is null || SyncApply is null)
-            return;
-
-        bool enabled = SyncToggle.IsChecked == true;
-        int percent = (int)BaseSlider.Value;
-        var period = schedule.ActiveAt(DateTime.Now)?.Period;
-        BrightnessModeHeading.Text = schedule.Enabled ? "定时调节" : enabled ? "同步调节" : "独立调节";
-        BaseValue.Text = $"同步基准亮度  {percent}%";
-        SyncControls.IsEnabled = enabled && !busy;
-        BaseControls.IsEnabled = !schedule.Enabled;
-        SyncApply.Content = schedule.Enabled ? "保存亮度修正" : "应用全部并保存";
-        SyncApply.IsEnabled = cards.Count > 0 && cards.All(card => card.Correction.HasValue) &&
-            (!schedule.Enabled || cards.Any(card => card.Correction != sync.CorrectionFor(card.Monitor.Id)));
+        BaseInput.IsEnabled = sync.Enabled && !schedule.Enabled && !busy;
         foreach (MonitorCard card in cards)
-            card.UpdateMode(enabled, percent, schedule.Enabled, period?.TargetFor(card.Monitor.Id, sync));
+            card.UpdateMode(sync.Enabled, schedule.Enabled);
         UpdateStatusLine();
     }
 
@@ -302,64 +305,105 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void SyncApplyClicked(object sender, RoutedEventArgs e)
+    private async void BaseConfirmed(object sender, RoutedEventArgs e)
     {
-        await WaitForAutomaticApplyAsync();
-        if (closed || busy || editingSchedule || !sync.Enabled || cards.Count == 0 ||
-            cards.Any(card => !card.Correction.HasValue))
+        if (closed || schedule.Enabled || !sync.Enabled || BaseInput.Number is not int percent)
             return;
 
-        var corrections = new Dictionary<string, int>(sync.Corrections, StringComparer.OrdinalIgnoreCase);
-        foreach (MonitorCard card in cards)
-            corrections[card.Monitor.Id] = card.Correction!.Value;
+        pendingBasePercent = percent;
+        await ApplyPendingEditsAsync();
+    }
 
+    private async void CorrectionConfirmed(object? sender, EventArgs e)
+    {
+        if (closed || !sync.Enabled || sender is not MonitorCard { Correction: int correction } card)
+            return;
+
+        pendingCorrections[card.Monitor.Id] = correction;
+        await ApplyPendingEditsAsync();
+    }
+
+    private async void ManualConfirmed(object? sender, EventArgs e)
+    {
+        if (closed || schedule.Enabled || sync.Enabled || sender is not MonitorCard { ManualPercent: int percent } card)
+            return;
+
+        pendingManualLevels[card.Monitor.Id] = (card.Monitor, percent);
+        await ApplyPendingEditsAsync();
+    }
+
+    private bool HasPendingEdits => pendingBasePercent.HasValue || pendingCorrections.Count > 0 || pendingManualLevels.Count > 0;
+
+    private void ResumePendingEdits()
+    {
+        if (!closed && HasPendingEdits)
+            _ = Dispatcher.InvokeAsync(ApplyPendingEditsAsync, DispatcherPriority.Background).Task.Unwrap();
+    }
+
+    private async Task ApplyPendingEditsAsync()
+    {
+        if (closed || busy || editingSchedule || automaticApply is not null || !HasPendingEdits)
+            return;
+
+        int? basePercent = pendingBasePercent;
+        pendingBasePercent = null;
+        var corrections = new Dictionary<string, int>(sync.Corrections, StringComparer.OrdinalIgnoreCase);
+        var changedCorrections = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (id, correction) in pendingCorrections)
+        {
+            if (correction == sync.CorrectionFor(id))
+                continue;
+            corrections[id] = correction;
+            changedCorrections.Add(id);
+        }
+        pendingCorrections.Clear();
+
+        var manualLevels = new Dictionary<string, (DdcMonitor Monitor, int Percent)>(pendingManualLevels, StringComparer.OrdinalIgnoreCase);
+        pendingManualLevels.Clear();
+        var updated = sync;
+        if (basePercent.HasValue || changedCorrections.Count > 0)
+            updated = sync with { BasePercent = basePercent ?? sync.BasePercent, Corrections = corrections };
+        foreach (var (monitor, percent) in manualLevels.Values)
+        {
+            if (updated.ManualPercentFor(monitor.Id) != percent)
+                updated = updated.WithManualPercent(monitor, percent);
+        }
+
+        if (!ReferenceEquals(updated, sync) && !TrySaveSync(updated))
+            return;
+
+        var changedCards = cards.Where(card => changedCorrections.Contains(card.Monitor.Id)).ToArray();
         if (schedule.Enabled)
         {
-            var changed = cards.Where(card => corrections[card.Monitor.Id] != sync.CorrectionFor(card.Monitor.Id)).ToArray();
-            if (changed.Length == 0 || !TrySaveSync(sync with { Corrections = corrections }))
-                return;
-
-            foreach (var card in changed)
-                scheduledMonitors.Remove(card.Monitor);
-            retryAfter = default;
-            UpdateSyncControls();
-            await CheckScheduleAsync();
+            if (sync.Enabled && changedCards.Length > 0)
+            {
+                foreach (var card in changedCards)
+                    scheduledMonitors.Remove(card.Monitor);
+                retryAfter = default;
+                await CheckScheduleAsync(changedCards);
+            }
             return;
         }
 
-        int percent = (int)BaseSlider.Value;
-        if (!TrySaveSync(sync with { BasePercent = percent, Corrections = corrections }))
-            return;
-
-        await ApplyManuallyAsync(cards.Select(card =>
-            (card, SyncPreferences.Adjust(percent, card.Correction!.Value))).ToArray());
-    }
-
-    private async void ManualApplyRequested(object? sender, EventArgs e)
-    {
-        await WaitForAutomaticApplyAsync();
-        if (!closed && !busy && !editingSchedule && !schedule.Enabled && !sync.Enabled &&
-            sender is MonitorCard card && cards.Contains(card) && card.Reading.HasValue &&
-            TrySaveSync(sync.WithManualPercent(card.Monitor, card.ManualPercent)))
-            await ApplyManuallyAsync([(card, card.ManualPercent)]);
+        var targets = sync.Enabled
+            ? (basePercent.HasValue ? cards.ToArray() : changedCards).Select(card =>
+                (card, SyncPreferences.Adjust(sync.BasePercent ?? defaultBasePercent, sync.CorrectionFor(card.Monitor.Id))))
+            : cards.Where(card => manualLevels.ContainsKey(card.Monitor.Id))
+                .Select(card => (card, manualLevels[card.Monitor.Id].Percent));
+        var pendingTargets = targets.ToArray();
+        if (pendingTargets.Length > 0)
+            await RunAutomaticApplyAsync(ApplyManuallyAsync(pendingTargets));
     }
 
     private async Task ApplyManuallyAsync((MonitorCard Card, int Target)[] targets)
     {
-        SetBusy(true);
-        try
-        {
-            int confirmed = await ApplyTargetsAsync(targets, scheduled: false);
-            MonitorCard? failed = targets.Select(target => target.Card).FirstOrDefault(card => card.Status.Length > 0);
-            SetStatus(confirmed == targets.Length
-                ? $"已确认 {confirmed} 台屏幕的亮度。"
-                : failed is null ? $"{targets.Length - confirmed} 台屏幕待检查。"
-                : $"{failed.Monitor.Position} · {failed.Status}");
-        }
-        finally
-        {
-            FinishOperation();
-        }
+        int confirmed = await ApplyTargetsAsync(targets, scheduled: false);
+        MonitorCard? failed = targets.Select(target => target.Card).FirstOrDefault(card => card.Status.Length > 0);
+        SetStatus(confirmed == targets.Length
+            ? ""
+            : failed is null ? $"{targets.Length - confirmed} 台屏幕待检查。"
+            : $"{failed.Monitor.Position} · {failed.Status}");
+        UpdateTrayBrightness();
     }
 
     private async Task<int> ApplyTargetsAsync((MonitorCard Card, int Target)[] targets, bool scheduled)
@@ -384,7 +428,7 @@ public partial class MainWindow : Window
 
                 card.SetReading(result.Reading, result.Confirmed
                     ? ""
-                    : $"目标 {target}%，显示器回报 {result.Reading.Percent}%。", preserveDraft: scheduled);
+                    : $"目标 {target}%，显示器回报 {result.Reading.Percent}%。");
                 if (result.Confirmed)
                 {
                     confirmedCount++;
@@ -417,7 +461,7 @@ public partial class MainWindow : Window
             (period is not null && !schedule.Periods.Any(entry => ReferenceEquals(entry, period))))
             return;
 
-        int basePercent = (int)BaseSlider.Value;
+        int basePercent = sync.BasePercent ?? defaultBasePercent;
         var dialog = new ScheduleEntryDialog(schedule, period, sync.Enabled, basePercent,
             cards.Select(card => (card.Monitor.Id, card.Monitor.Name, sync.ManualPercentFor(card.Monitor.Id) ?? basePercent)).ToArray())
         {
@@ -432,6 +476,7 @@ public partial class MainWindow : Window
         finally
         {
             editingSchedule = false;
+            ResumePendingEdits();
         }
 
         if (closed)
@@ -445,6 +490,7 @@ public partial class MainWindow : Window
     private async void ScheduleToggleClicked(object sender, RoutedEventArgs e)
     {
         await WaitForAutomaticApplyAsync();
+        await ApplyPendingEditsAsync();
         if (closed)
             return;
         if (busy || editingSchedule)
@@ -525,7 +571,7 @@ public partial class MainWindow : Window
         await CheckScheduleAsync();
     }
 
-    private async Task CheckScheduleAsync()
+    private async Task CheckScheduleAsync(IReadOnlyCollection<MonitorCard>? priority = null)
     {
         if (closed || busy || automaticApply is not null || editingSchedule || !schedule.Enabled)
             return;
@@ -563,22 +609,30 @@ public partial class MainWindow : Window
         if (DateTimeOffset.UtcNow < retryAfter)
             return;
 
-        automaticApply = ApplyScheduledTargetsAsync(slot);
+        await RunAutomaticApplyAsync(ApplyScheduledTargetsAsync(slot, priority));
+    }
+
+    private async Task RunAutomaticApplyAsync(Task operation)
+    {
+        automaticApply = operation;
         try
         {
-            await automaticApply;
+            await operation;
         }
         finally
         {
             automaticApply = null;
             if (closed)
                 ReleaseCards();
+            else
+                ResumePendingEdits();
         }
     }
 
-    private async Task ApplyScheduledTargetsAsync(BrightnessPeriod slot)
+    private async Task ApplyScheduledTargetsAsync(BrightnessPeriod slot, IReadOnlyCollection<MonitorCard>? priority)
     {
         var pending = cards.Where(card => !scheduledMonitors.Contains(card.Monitor))
+            .OrderByDescending(card => priority?.Contains(card) == true)
             .Select(card => (card, slot.TargetFor(card.Monitor.Id, sync))).ToArray();
         await ApplyTargetsAsync(pending, scheduled: true);
         int remaining = cards.Count - scheduledMonitors.Count;
@@ -637,13 +691,13 @@ public partial class MainWindow : Window
                     Brightness reading = await Task.Run(card.Monitor.Read);
                     if (closed)
                         break;
-                    card.SetReading(reading, "", preserveDraft: true);
+                    card.SetReading(reading, "");
                 }
                 catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
                 {
                     if (closed)
                         break;
-                    card.SetReading(null, "暂时无法读取亮度。", preserveDraft: true);
+                    card.SetReading(null, "暂时无法读取亮度。");
                 }
             }
         }
@@ -682,9 +736,14 @@ public partial class MainWindow : Window
             return;
 
         string text = statusMessage;
-        if (!busy && SyncToggle.IsChecked == true &&
+        if (BaseInput is { IsEnabled: true, Number: null })
+            text = "基准亮度请输入 0 到 100 的整数。";
+        else if (!busy && sync.Enabled &&
             cards.FirstOrDefault(card => !card.Correction.HasValue) is { } invalid)
             text = $"{invalid.Monitor.Position} · 亮度修正请输入 −100 到 +100 的整数。";
+        else if (!busy && !sync.Enabled && !schedule.Enabled &&
+            cards.FirstOrDefault(card => !card.ManualPercent.HasValue) is { } invalidManual)
+            text = $"{invalidManual.Monitor.Position} · 亮度请输入 0 到 100 的整数。";
         if (text.Length == 0)
             text = scheduleMessage;
         if (text.Length == 0 && cards.FirstOrDefault(card => card.Status.Length > 0) is { } failed)
@@ -727,6 +786,7 @@ public partial class MainWindow : Window
         {
             SetBusy(false);
             UpdateTrayBrightness();
+            ResumePendingEdits();
         }
     }
 

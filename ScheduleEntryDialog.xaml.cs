@@ -3,16 +3,11 @@ using System.Globalization;
 using System.IO;
 using System.Windows;
 using System.Windows.Automation.Peers;
-using System.Windows.Controls;
-using System.Windows.Input;
 
 namespace DisplayBrightness;
 
 public partial class ScheduleEntryDialog : Window
 {
-    public static IReadOnlyList<string> Hours { get; } = TimeOptions(24);
-    public static IReadOnlyList<string> Minutes { get; } = TimeOptions(60);
-
     private readonly BrightnessSchedule schedule;
     private readonly BrightnessPeriod? original;
     private readonly (string Id, string Name, int DefaultPercent)[] monitors;
@@ -37,27 +32,23 @@ public partial class ScheduleEntryDialog : Window
         DeleteButton.Visibility = original is null ? Visibility.Collapsed : Visibility.Visible;
         BrightnessFields.ItemsSource = fields;
         var start = original?.Start ?? new TimeOnly((DateTime.Now.Hour + 1) % 24, 0);
-        HourPicker.SelectedIndex = start.Hour;
-        MinutePicker.SelectedIndex = start.Minute;
+        HourPicker.Text = start.Hour.ToString("D2", CultureInfo.InvariantCulture);
+        MinutePicker.Text = start.Minute.ToString("D2", CultureInfo.InvariantCulture);
     }
 
     internal BrightnessSchedule UpdatedSchedule { get; private set; } = BrightnessSchedule.Empty;
 
-    private void BrightnessInputFocused(object sender, KeyboardFocusChangedEventArgs e)
-    {
-        if (sender is TextBox input)
-            input.SelectAll();
-    }
+    private void DialogRendered(object? sender, EventArgs e) => HourPicker.FocusEditor();
 
     private void SaveClicked(object sender, RoutedEventArgs e)
     {
-        if (HourPicker.SelectedIndex < 0 || MinutePicker.SelectedIndex < 0)
+        if (HourPicker.Number is not int hour || MinutePicker.Number is not int minute)
         {
-            ShowError("请选择开始时间。");
+            ShowError("小时请输入 0 到 23，分钟请输入 0 到 59。");
             return;
         }
 
-        var start = new TimeOnly(HourPicker.SelectedIndex, MinutePicker.SelectedIndex);
+        var start = new TimeOnly(hour, minute);
         if (schedule.Periods.Any(period => !ReferenceEquals(period, original) && period.Start == start))
         {
             ShowError("这个时间已有一条计划，请选择其他时间。");
@@ -117,8 +108,6 @@ public partial class ScheduleEntryDialog : Window
         UIElementAutomationPeer.FromElement(ErrorText)?.RaiseAutomationEvent(AutomationEvents.LiveRegionChanged);
     }
 
-    private static string[] TimeOptions(int count) =>
-        Enumerable.Range(0, count).Select(value => value.ToString("D2", CultureInfo.InvariantCulture)).ToArray();
 }
 
 internal sealed class ScheduleBrightnessField(string name, int initialPercent) : INotifyPropertyChanged
