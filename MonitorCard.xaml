@@ -1,0 +1,45 @@
+<UserControl x:Class="DisplayBrightness.MonitorCard"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" MaxWidth="380" Margin="6,0,6,12">
+    <Border Style="{StaticResource Card}" Background="{StaticResource CanvasBrush}">
+        <StackPanel>
+            <Grid>
+                <Border Width="42" Height="42" CornerRadius="10" Background="{StaticResource ControlBrush}"
+                        HorizontalAlignment="Left" VerticalAlignment="Top">
+                    <Path Width="22" Height="20" Stretch="Uniform" Stroke="{StaticResource AccentBrush}"
+                          StrokeThickness="1.6" StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                          Data="M 2,2 H 22 V 15 H 2 Z M 12,15 V 20 M 8,20 H 16"/>
+                </Border>
+                <StackPanel Margin="54,0,0,0" VerticalAlignment="Center">
+                    <TextBlock x:Name="MonitorName" FontSize="16" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                    <TextBlock x:Name="MonitorDescription" Foreground="{StaticResource MutedBrush}"
+                               FontSize="12" TextTrimming="CharacterEllipsis" Margin="0,2,0,0"/>
+                </StackPanel>
+            </Grid>
+            <Grid Margin="0,14,0,0">
+                <StackPanel VerticalAlignment="Center">
+                    <TextBlock Text="当前亮度" Foreground="{StaticResource MutedBrush}"/>
+                    <TextBlock x:Name="CurrentValue" Text="—" Margin="0,2,0,0"/>
+                </StackPanel>
+                <StackPanel HorizontalAlignment="Right">
+                    <TextBlock x:Name="TargetLabel" Text="目标亮度" Foreground="{StaticResource MutedBrush}" HorizontalAlignment="Right"/>
+                    <TextBlock x:Name="TargetValue" Text="—" Foreground="{StaticResource AccentBrush}"
+                               FontFamily="Segoe UI" FontSize="34" FontWeight="SemiBold" HorizontalAlignment="Right"/>
+                </StackPanel>
+            </Grid>
+            <Grid MinHeight="68" Margin="0,4,0,0">
+                <StackPanel x:Name="ManualControls">
+                    <Slider x:Name="ManualSlider" ValueChanged="ManualChanged"/>
+                    <Button x:Name="ManualApply" Content="应用亮度" HorizontalAlignment="Right" Click="ApplyClicked"/>
+                </StackPanel>
+                <Grid x:Name="CorrectionControls" Visibility="Collapsed" VerticalAlignment="Top" Margin="0,10,0,0">
+                    <TextBlock Text="亮度修正" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,92,0"/>
+                    <TextBox x:Name="CorrectionInput" Width="78" MinHeight="44" HorizontalAlignment="Right"
+                             FontSize="17" MaxLength="4" TextAlignment="Center"
+                             ToolTip="在基准亮度上加减百分点"
+                             AutomationProperties.Name="亮度修正" TextChanged="CorrectionChanged"/>
+                </Grid>
+            </Grid>
+        </StackPanel>
+    </Border>
+</UserControl>
