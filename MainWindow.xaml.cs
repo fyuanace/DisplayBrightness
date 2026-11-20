@@ -6,6 +6,7 @@ using System.Windows;
 using System.Windows.Automation.Peers;
 using System.Windows.Controls;
 using System.Windows.Threading;
+using Microsoft.Win32;
 
 namespace DisplayBrightness;
 
@@ -22,6 +23,8 @@ public partial class MainWindow : Window
     private readonly Dictionary<string, (DdcMonitor Monitor, int Percent)> pendingManualLevels = new(StringComparer.OrdinalIgnoreCase);
     private int? pendingBasePercent;
     private int defaultBasePercent = 50;
+    private readonly Dictionary<string, (int Target, DateTimeOffset RetryAt)> failedManualTargets = new(StringComparer.OrdinalIgnoreCase);
+    private bool monitorRecoveryRequested;
     private readonly HashSet<DdcMonitor> scheduledMonitors = [];
     private BrightnessSchedule schedule = BrightnessSchedule.Empty;
     private SyncPreferences sync = SyncPreferences.Default;
@@ -102,6 +105,9 @@ public partial class MainWindow : Window
 
         initialized = true;
         scheduleTimer.Tick += ScheduleTick;
+        SystemEvents.PowerModeChanged += PowerModeChanged;
+        SystemEvents.DisplaySettingsChanged += DisplaySettingsChanged;
+        SystemEvents.SessionSwitch += SessionSwitched;
         scheduleTimer.Start();
         await CheckScheduleAsync();
     }
@@ -261,6 +267,7 @@ public partial class MainWindow : Window
                 SyncToggle.IsChecked = sync.Enabled;
             else
             {
+                failedManualTargets.Clear();
                 if (!enabled)
                 {
                     foreach (var card in cards)
@@ -414,14 +421,14 @@ public partial class MainWindow : Window
             if (closed)
                 break;
 
+            if (!scheduled)
+                failedManualTargets[card.Monitor.Id] = (target, DateTimeOffset.UtcNow.AddSeconds(30));
             try
             {
                 var result = await Task.Run(() =>
                 {
-                    Brightness before = card.Monitor.Read();
-                    uint expected = before.FromPercent(target);
-                    Brightness reading = before.Current == expected ? before : card.Monitor.Set(target, before);
-                    return (Reading: reading, Confirmed: reading.Current == expected);
+                    Brightness reading = card.Monitor.Set(target);
+                    return (Reading: reading, Confirmed: reading.Current == reading.FromPercent(target));
                 });
                 if (closed)
                     break;
@@ -432,6 +439,7 @@ public partial class MainWindow : Window
                 if (result.Confirmed)
                 {
                     confirmedCount++;
+                    failedManualTargets.Remove(card.Monitor.Id);
                     if (scheduled || (activePeriod is not null && activePeriod == schedule.ActiveAt(DateTime.Now)))
                         scheduledMonitors.Add(card.Monitor);
                 }
@@ -439,7 +447,9 @@ public partial class MainWindow : Window
             catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
             {
                 if (!closed)
-                    card.SetReading(null, "无法确认亮度。请确认显示器已点亮后重试。");
+                    card.SetReading(null, ex is Win32Exception error
+                        ? $"亮度通信失败（0x{error.NativeErrorCode:X8}），稍后重试。"
+                        : "无法确认亮度，稍后重试。");
             }
         }
 
@@ -519,6 +529,8 @@ public partial class MainWindow : Window
 
     private async Task ApplyUpdatedScheduleAsync(BrightnessSchedule updated)
     {
+        if (updated.Enabled)
+            failedManualTargets.Clear();
         var now = DateTime.Now;
         if (schedule.ActiveAt(now) != updated.ActiveAt(now))
         {
@@ -564,11 +576,61 @@ public partial class MainWindow : Window
 
     private async void ScheduleTick(object? sender, EventArgs e)
     {
-        if (retryStartupDiscovery && !busy && automaticApply is null && !editingSchedule &&
+        if (closed || busy || automaticApply is not null || editingSchedule)
+            return;
+
+        if (monitorRecoveryRequested)
+        {
+            monitorRecoveryRequested = false;
+            scheduledMonitors.Clear();
+            retryAfter = default;
+            foreach (string id in failedManualTargets.Keys.ToArray())
+                failedManualTargets[id] = (failedManualTargets[id].Target, default);
+            if (cards.Count > 0)
+                await RunAutomaticApplyAsync(ReadMonitorCardsAsync());
+            else
+                retryStartupDiscovery = true;
+        }
+
+        if (retryStartupDiscovery && !closed && !busy && automaticApply is null && !editingSchedule &&
             DateTimeOffset.UtcNow >= startupDiscoveryAfter)
             await RefreshAsync();
 
+        if (!closed && !busy && automaticApply is null && !editingSchedule && !schedule.Enabled && !HasPendingEdits)
+        {
+            var targets = cards.Where(card => failedManualTargets.TryGetValue(card.Monitor.Id, out var failed) &&
+                DateTimeOffset.UtcNow >= failed.RetryAt)
+                .Select(card => (card, failedManualTargets[card.Monitor.Id].Target)).ToArray();
+            if (targets.Length > 0)
+                await RunAutomaticApplyAsync(ApplyManuallyAsync(targets));
+        }
         await CheckScheduleAsync();
+    }
+
+    private void RequestMonitorRecovery()
+    {
+        _ = Dispatcher.InvokeAsync(() =>
+        {
+            if (!closed)
+            {
+                monitorRecoveryRequested = true;
+                startupDiscoveryAfter = default;
+            }
+        });
+    }
+
+    private void PowerModeChanged(object sender, PowerModeChangedEventArgs e)
+    {
+        if (e.Mode == PowerModes.Resume)
+            RequestMonitorRecovery();
+    }
+
+    private void DisplaySettingsChanged(object? sender, EventArgs e) => RequestMonitorRecovery();
+
+    private void SessionSwitched(object sender, SessionSwitchEventArgs e)
+    {
+        if (e.Reason == SessionSwitchReason.SessionUnlock)
+            RequestMonitorRecovery();
     }
 
     private async Task CheckScheduleAsync(IReadOnlyCollection<MonitorCard>? priority = null)
@@ -684,27 +746,37 @@ public partial class MainWindow : Window
         SetBusy(true);
         try
         {
-            foreach (MonitorCard card in cards)
-            {
-                try
-                {
-                    Brightness reading = await Task.Run(card.Monitor.Read);
-                    if (closed)
-                        break;
-                    card.SetReading(reading, "");
-                }
-                catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
-                {
-                    if (closed)
-                        break;
-                    card.SetReading(null, "暂时无法读取亮度。");
-                }
-            }
+            await ReadMonitorCardsAsync();
         }
         finally
         {
             FinishOperation();
         }
+    }
+
+    private async Task ReadMonitorCardsAsync()
+    {
+        foreach (MonitorCard card in cards)
+        {
+            if (closed)
+                break;
+            try
+            {
+                Brightness reading = await Task.Run(card.Monitor.Read);
+                if (closed)
+                    break;
+                card.SetReading(reading, "");
+            }
+            catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
+            {
+                if (closed)
+                    break;
+                card.SetReading(null, "暂时无法读取亮度。");
+                scheduledMonitors.Remove(card.Monitor);
+            }
+        }
+        UpdateStatusLine();
+        UpdateTrayBrightness();
     }
 
     internal void ShowFromTray()
@@ -811,6 +883,9 @@ public partial class MainWindow : Window
     {
         closed = true;
         scheduleTimer.Stop();
+        SystemEvents.PowerModeChanged -= PowerModeChanged;
+        SystemEvents.DisplaySettingsChanged -= DisplaySettingsChanged;
+        SystemEvents.SessionSwitch -= SessionSwitched;
         tray?.Dispose();
         if (!busy && automaticApply is null)
             ReleaseCards();

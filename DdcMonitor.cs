@@ -15,11 +15,13 @@ internal readonly record struct Brightness(uint Minimum, uint Current, uint Maxi
         Minimum + (uint)Math.Round((Maximum - Minimum) * (percent / 100.0));
 }
 
-internal sealed class DdcMonitor(string name, string description, string id, PhysicalMonitorHandle handle) : IDisposable
+internal sealed class DdcMonitor(string name, string description, string id, PhysicalMonitorHandle initialHandle) : IDisposable
 {
     private const byte Luminance = 0x10;
     private const int Attempts = 3;
     private const int ReplyDelayMs = 120;
+    private readonly object commandLock = new();
+    private PhysicalMonitorHandle handle = initialHandle;
     private bool useVcp;
     public string Name => $"{Description} · {Position}";
     public string Position { get; } = name;
@@ -125,7 +127,48 @@ internal sealed class DdcMonitor(string name, string description, string id, Phy
             && !string.IsNullOrWhiteSpace(device.DeviceId) ? device.DeviceId : null;
     }
 
-    public Brightness Read()
+    public Brightness Read() => WithRecovery(ReadWithRetry);
+
+    private Brightness WithRecovery(Func<Brightness> operation)
+    {
+        lock (commandLock)
+        {
+            ObjectDisposedException.ThrowIf(handle.IsClosed, this);
+            try
+            {
+                return operation();
+            }
+            catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
+            {
+                Reconnect();
+                Thread.Sleep(500);
+                return operation();
+            }
+        }
+    }
+
+    private void Reconnect()
+    {
+        var discovered = Discover();
+        try
+        {
+            var matches = discovered.Where(monitor =>
+                string.Equals(monitor.Id, Id, StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (matches.Length != 1)
+                throw new InvalidOperationException("无法重新连接到原显示器。");
+
+            var replacement = matches[0];
+            (handle, replacement.handle) = (replacement.handle, handle);
+            useVcp = false;
+        }
+        finally
+        {
+            foreach (var monitor in discovered)
+                monitor.Dispose();
+        }
+    }
+
+    private Brightness ReadWithRetry()
     {
         for (int attempt = 1; ; attempt++)
         {
@@ -133,9 +176,9 @@ internal sealed class DdcMonitor(string name, string description, string id, Phy
             {
                 return ReadOnce();
             }
-            catch (Win32Exception) when (attempt < Attempts)
+            catch (Exception ex) when (attempt < Attempts && ex is Win32Exception or InvalidOperationException)
             {
-                Thread.Sleep(ReplyDelayMs);
+                Thread.Sleep(250 * attempt);
             }
         }
     }
@@ -146,7 +189,12 @@ internal sealed class DdcMonitor(string name, string description, string id, Phy
             && max > min && current >= min && current <= max)
             return new Brightness(min, current, max);
 
-        if (!Native.GetVCPFeatureAndVCPFeatureReply(handle, Luminance, IntPtr.Zero, out current, out max))
+        return ReadVcp();
+    }
+
+    private Brightness ReadVcp()
+    {
+        if (!Native.GetVCPFeatureAndVCPFeatureReply(handle, Luminance, IntPtr.Zero, out uint current, out uint max))
             throw new Win32Exception();
         if (max == 0 || current > max)
             throw new InvalidOperationException("显示器返回了无效的亮度范围。");
@@ -155,32 +203,53 @@ internal sealed class DdcMonitor(string name, string description, string id, Phy
         return new Brightness(0, current, max);
     }
 
-    public Brightness Set(int percent, Brightness previous)
+    public Brightness Set(int percent)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(percent, 0);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(percent, 100);
+        return WithRecovery(() => SetWithRetry(percent));
+    }
+
+    private Brightness SetWithRetry(int percent)
+    {
+        Brightness previous = ReadWithRetry();
         uint target = previous.FromPercent(percent);
+        if (previous.Current == target)
+            return previous;
+
         for (int attempt = 1; ; attempt++)
         {
             bool accepted = useVcp
                 ? Native.SetVCPFeature(handle, Luminance, target)
                 : Native.SetMonitorBrightness(handle, target);
+            if (!accepted && !useVcp)
+            {
+                previous = ReadVcp();
+                target = previous.FromPercent(percent);
+                accepted = Native.SetVCPFeature(handle, Luminance, target);
+            }
             if (accepted)
                 break;
             if (attempt == Attempts)
                 throw new Win32Exception();
-            Thread.Sleep(ReplyDelayMs);
+            Thread.Sleep(250 * attempt);
         }
 
         // Some displays need time before the next DDC/CI read reflects the new value.
         for (int attempt = 1; ; attempt++)
         {
             Thread.Sleep(ReplyDelayMs);
-            Brightness result = Read();
+            Brightness result = ReadWithRetry();
             if (result.Current == target || attempt == Attempts)
                 return result;
         }
     }
 
-    public void Dispose() => handle.Dispose();
+    public void Dispose()
+    {
+        lock (commandLock)
+            handle.Dispose();
+    }
 }
 
 internal sealed class PhysicalMonitorHandle : SafeHandleZeroOrMinusOneIsInvalid
